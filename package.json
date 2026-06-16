@@ -1,0 +1,13 @@
+{
+  "name": "kodaai",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n backend,frontend -c blue,green \"python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000\" \"npm run dev --prefix frontend\"",
+    "install:all": "pip install -e . && npm install --prefix frontend",
+    "build": "npm run build --prefix frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
