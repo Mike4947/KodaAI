@@ -33,7 +33,6 @@ BINARY_EXTENSIONS = {
     ".pyc", ".pyo", ".class", ".o", ".a",
     ".mp3", ".mp4", ".avi", ".mov", ".wav",
     ".db", ".sqlite", ".sqlite3",
-    ".lock",  # large lockfiles still readable but skip binary locks
 }
 
 STACK_MARKERS = {

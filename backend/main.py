@@ -32,6 +32,7 @@ from backend.scanner.agent import (
     findings_to_markdown,
     get_scan_events,
     get_scan_from_db,
+    list_scans,
     run_scan,
 )
 
@@ -214,6 +215,15 @@ async def prompts_delete(prompt_id: int):
 
 # --- Scans ---
 
+@app.get("/api/scans")
+async def scans_list(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=50),
+    status: str = Query("ongoing", description="ongoing, all, or a specific status"),
+):
+    return list_scans(page=page, per_page=per_page, status_filter=status)
+
+
 @app.post("/api/scan")
 async def scan_start(req: ScanRequest, background_tasks: BackgroundTasks):
     repo = get_repo(req.repo_id)
@@ -266,7 +276,13 @@ async def scan_stream(scan_id: str):
         raise HTTPException(404, "Scan not found")
 
     async def event_generator():
-        sent = 0
+        db_scan = get_scan_from_db(scan_id)
+        if db_scan:
+            yield f"data: {json.dumps({'type': 'snapshot', 'data': {'status': db_scan['status'], 'summary': db_scan.get('summary'), 'activity_log': db_scan['activity_log'], 'findings': db_scan['findings']}})}\n\n"
+
+        state = get_scan_events(scan_id)
+        sent = len(state.get("events", [])) if state else 0
+
         while True:
             state = get_scan_events(scan_id)
             if state:

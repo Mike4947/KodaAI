@@ -1,8 +1,7 @@
-import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from backend.config import settings
 from backend.db import _now, get_db
@@ -10,9 +9,30 @@ from backend.ollama.client import OllamaClient, parse_tool_calls
 from backend.scanner.indexer import index_repo
 from backend.scanner.tools import TOOL_DEFINITIONS, ToolExecutor
 
-# In-memory scan state for SSE and cancellation
 _active_scans: dict[str, dict] = {}
 _cancel_flags: dict[str, bool] = {}
+MAX_LOG_FIELD = 12000
+
+
+def _clip(text: str, limit: int = MAX_LOG_FIELD) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... ({len(text) - limit} more characters truncated)"
+
+
+def _log_activity(
+    scan_id: str,
+    activity: list[dict],
+    findings: list[dict],
+    status: str,
+    entry: dict,
+    *,
+    persist: bool = True,
+):
+    activity.append(entry)
+    _emit(scan_id, "activity", entry)
+    if persist:
+        _update_scan_db(scan_id, status, findings, None, activity)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -20,7 +40,6 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _trim_messages(messages: list[dict], max_tokens: int = 16000) -> list[dict]:
-    """Keep system + initial user, trim oldest tool results from the middle."""
     if len(messages) <= 3:
         return messages
 
@@ -37,7 +56,7 @@ def _trim_messages(messages: list[dict], max_tokens: int = 16000) -> list[dict]:
     return [system, initial] + rest
 
 
-def create_scan(repo_id: str, model: str, prompt_body: str, prompt_id: int | None) -> dict:
+def create_scan_record(repo_id: str, model: str, prompt_id: int | None) -> str:
     scan_id = str(uuid.uuid4())
     now = _now()
     with get_db() as conn:
@@ -57,13 +76,15 @@ def create_scan(repo_id: str, model: str, prompt_body: str, prompt_id: int | Non
         "activity": [],
     }
     _cancel_flags[scan_id] = False
-
-    asyncio.create_task(_run_scan(scan_id, repo_id, model, prompt_body))
-    return {"id": scan_id, "status": "pending"}
+    return scan_id
 
 
 def cancel_scan(scan_id: str) -> bool:
     if scan_id in _cancel_flags:
+        _cancel_flags[scan_id] = True
+        return True
+    scan = get_scan_from_db(scan_id)
+    if scan and scan["status"] in ("pending", "indexing", "running"):
         _cancel_flags[scan_id] = True
         return True
     return False
@@ -94,8 +115,18 @@ def _update_scan_db(scan_id: str, status: str, findings: list, summary: str | No
         )
 
 
-async def _run_scan(scan_id: str, repo_id: str, model: str, prompt_body: str):
+async def run_scan(scan_id: str, repo_id: str, model: str, prompt_body: str):
     from backend.github.repos import get_repo
+
+    if scan_id not in _active_scans:
+        _active_scans[scan_id] = {
+            "events": [],
+            "status": "pending",
+            "findings": [],
+            "summary": None,
+            "activity": [],
+        }
+        _cancel_flags[scan_id] = False
 
     repo = get_repo(repo_id)
     if not repo:
@@ -104,18 +135,44 @@ async def _run_scan(scan_id: str, repo_id: str, model: str, prompt_body: str):
         return
 
     repo_root = repo["local_path"]
+    findings: list[dict] = []
+    activity: list[dict] = []
+
     _emit(scan_id, "status", {"status": "indexing"})
-    _update_scan_db(scan_id, "indexing", [], None, [])
+    _update_scan_db(scan_id, "indexing", findings, None, activity)
+
+    _log_activity(
+        scan_id,
+        activity,
+        findings,
+        "indexing",
+        {
+            "kind": "phase",
+            "turn": 0,
+            "action": "indexing",
+            "message": f"Indexing repository {repo['full_name']}...",
+        },
+    )
 
     try:
         index = index_repo(repo_root)
     except Exception as e:
         _emit(scan_id, "status", {"status": "error", "message": f"Indexing failed: {e}"})
-        _update_scan_db(scan_id, "error", [], None, [])
+        _update_scan_db(scan_id, "error", findings, None, activity)
         return
 
-    findings: list[dict] = []
-    activity: list[dict] = []
+    _log_activity(
+        scan_id,
+        activity,
+        findings,
+        "indexing",
+        {
+            "kind": "phase",
+            "turn": 0,
+            "action": "indexed",
+            "message": f"Indexed {index.total_files} files ({index.total_lines} lines). Stacks: {', '.join(index.stacks) or 'unknown'}.",
+        },
+    )
 
     def on_finding(f: dict):
         _emit(scan_id, "finding", f)
@@ -123,7 +180,6 @@ async def _run_scan(scan_id: str, repo_id: str, model: str, prompt_body: str):
     executor = ToolExecutor(repo_root, findings, on_finding=on_finding)
     client = OllamaClient(model)
 
-    system_msg = prompt_body
     user_msg = (
         f"You are analyzing repository: {repo['full_name']}\n\n"
         f"## Repository structure\n{index.tree_summary()}\n\n"
@@ -131,7 +187,7 @@ async def _run_scan(scan_id: str, repo_id: str, model: str, prompt_body: str):
     )
 
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_msg},
+        {"role": "system", "content": prompt_body},
         {"role": "user", "content": user_msg},
     ]
 
@@ -146,48 +202,126 @@ async def _run_scan(scan_id: str, repo_id: str, model: str, prompt_body: str):
 
         messages = _trim_messages(messages)
 
+        _log_activity(
+            scan_id,
+            activity,
+            findings,
+            "running",
+            {
+                "kind": "phase",
+                "turn": turn + 1,
+                "action": "model_request",
+                "message": f"Turn {turn + 1}: Sending context to {model} and waiting for response...",
+            },
+        )
+
         try:
             response = await client.chat(messages, tools=TOOL_DEFINITIONS)
         except Exception as e:
             _emit(scan_id, "status", {"status": "error", "message": f"Ollama error: {e}"})
+            _log_activity(
+                scan_id,
+                activity,
+                findings,
+                "error",
+                {
+                    "kind": "error",
+                    "turn": turn + 1,
+                    "action": "ollama_error",
+                    "message": str(e),
+                },
+            )
             _update_scan_db(scan_id, "error", findings, None, activity)
             return
 
         msg = response.get("message", {})
-        content = msg.get("content", "")
+        content = msg.get("content", "") or ""
+        thinking = msg.get("thinking", "") or ""
         tool_calls = parse_tool_calls(msg)
 
         messages.append(msg)
 
-        act_entry = {"turn": turn + 1, "action": "model_response", "content": (content or "")[:500]}
+        model_entry: dict[str, Any] = {
+            "kind": "model",
+            "turn": turn + 1,
+            "action": "model_response",
+            "content": _clip(content),
+        }
+        if thinking:
+            model_entry["thinking"] = _clip(thinking)
         if tool_calls:
-            act_entry["tool_calls"] = [tc["name"] for tc in tool_calls]
-        activity.append(act_entry)
-        _emit(scan_id, "activity", act_entry)
+            model_entry["tool_calls"] = [
+                {"name": tc["name"], "arguments": tc["arguments"]} for tc in tool_calls
+            ]
+        _log_activity(scan_id, activity, findings, "running", model_entry)
 
         if not tool_calls:
-            # Nudge model to use tools or finish
+            if content:
+                _log_activity(
+                    scan_id,
+                    activity,
+                    findings,
+                    "running",
+                    {
+                        "kind": "note",
+                        "turn": turn + 1,
+                        "action": "model_message",
+                        "message": "Model responded without tool calls.",
+                        "content": _clip(content),
+                    },
+                )
             if turn < settings.max_agent_turns - 1:
-                messages.append({
-                    "role": "user",
-                    "content": "Continue analysis using tools (list_directory, read_file, search_files) or call finish_scan when done.",
-                })
+                nudge = "Continue analysis using tools (list_directory, read_file, search_files) or call finish_scan when done."
+                messages.append({"role": "user", "content": nudge})
+                _log_activity(
+                    scan_id,
+                    activity,
+                    findings,
+                    "running",
+                    {
+                        "kind": "system",
+                        "turn": turn + 1,
+                        "action": "nudge",
+                        "message": nudge,
+                    },
+                )
                 continue
             break
 
         for tc in tool_calls:
             name = tc["name"]
             args = tc["arguments"]
+
+            _log_activity(
+                scan_id,
+                activity,
+                findings,
+                "running",
+                {
+                    "kind": "tool_call",
+                    "turn": turn + 1,
+                    "action": name,
+                    "args": args,
+                },
+            )
+
             result = executor.execute(name, args)
 
-            act = {"turn": turn + 1, "action": name, "args": args, "result_preview": result[:300]}
-            activity.append(act)
-            _emit(scan_id, "activity", act)
+            _log_activity(
+                scan_id,
+                activity,
+                findings,
+                "running",
+                {
+                    "kind": "tool_result",
+                    "turn": turn + 1,
+                    "action": name,
+                    "args": args,
+                    "result": _clip(result),
+                },
+            )
 
-            messages.append({
-                "role": "tool",
-                "content": result,
-            })
+            messages.append({"role": "tool", "content": result, "tool_name": name})
 
             if executor.finished:
                 summary = executor.summary or "Scan completed."
@@ -211,14 +345,98 @@ def get_scan_from_db(scan_id: str) -> dict | None:
         return d
 
 
+ONGOING_STATUSES = ("pending", "indexing", "running")
+TERMINAL_STATUSES = ("completed", "error", "cancelled")
+
+
+def list_scans(
+    page: int = 1,
+    per_page: int = 10,
+    status_filter: str = "ongoing",
+) -> dict:
+    page = max(1, page)
+    per_page = max(1, min(per_page, 50))
+    offset = (page - 1) * per_page
+
+    conditions = []
+    params: list = []
+
+    if status_filter == "ongoing":
+        placeholders = ",".join("?" * len(ONGOING_STATUSES))
+        conditions.append(f"s.status IN ({placeholders})")
+        params.extend(ONGOING_STATUSES)
+    elif status_filter != "all":
+        conditions.append("s.status = ?")
+        params.append(status_filter)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    with get_db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) as c FROM scans s {where}",
+            params,
+        ).fetchone()["c"]
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                s.id, s.repo_id, s.model, s.status, s.summary,
+                s.findings, s.created_at, s.updated_at, s.prompt_id,
+                r.full_name as repo_full_name,
+                r.owner as repo_owner,
+                r.name as repo_name,
+                p.name as prompt_name
+            FROM scans s
+            LEFT JOIN repos r ON s.repo_id = r.id
+            LEFT JOIN system_prompts p ON s.prompt_id = p.id
+            {where}
+            ORDER BY s.created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, per_page, offset],
+        ).fetchall()
+
+    scans = []
+    for row in rows:
+        d = dict(row)
+        findings = json.loads(d.pop("findings", "[]"))
+        d["findings_count"] = len(findings)
+
+        live = get_scan_events(d["id"])
+        if live and live.get("status"):
+            d["status"] = live["status"]
+            d["findings_count"] = max(d["findings_count"], len(live.get("findings", [])))
+
+        scans.append(d)
+
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    return {
+        "scans": scans,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "ongoing_count": _count_ongoing(),
+    }
+
+
+def _count_ongoing() -> int:
+    placeholders = ",".join("?" * len(ONGOING_STATUSES))
+    with get_db() as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) as c FROM scans WHERE status IN ({placeholders})",
+            ONGOING_STATUSES,
+        ).fetchone()["c"]
+
+
 def findings_to_markdown(scan: dict) -> str:
     lines = [
-        f"# Code Analysis Report",
-        f"",
+        "# Code Analysis Report",
+        "",
         f"**Repository scan ID:** {scan['id']}",
         f"**Status:** {scan['status']}",
         f"**Model:** {scan['model']}",
-        f"",
+        "",
     ]
     if scan.get("summary"):
         lines.extend(["## Executive Summary", "", scan["summary"], ""])

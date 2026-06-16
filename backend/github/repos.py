@@ -4,7 +4,6 @@ import os
 import re
 import secrets
 import uuid
-from urllib.parse import urlparse
 
 import git
 
