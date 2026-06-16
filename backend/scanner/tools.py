@@ -156,6 +156,8 @@ class ToolExecutor:
         prefix = path_prefix.strip().lstrip("/").replace("\\", "/") if path_prefix else ""
         matches = []
         max_matches = 30
+        files_scanned = 0
+        lines_scanned = 0
 
         for dirpath, _, filenames in os.walk(self.repo_root):
             rel_dir = os.path.relpath(dirpath, self.repo_root).replace("\\", "/")
@@ -163,6 +165,12 @@ class ToolExecutor:
                 rel_dir = ""
 
             for filename in filenames:
+                if files_scanned >= settings.max_search_files:
+                    matches.append(
+                        f"(search stopped: scanned {settings.max_search_files} files — narrow path_prefix)"
+                    )
+                    return "\n".join(matches)
+
                 rel_path = f"{rel_dir}/{filename}" if rel_dir else filename
                 if prefix and not rel_path.startswith(prefix):
                     continue
@@ -171,8 +179,15 @@ class ToolExecutor:
                 try:
                     if os.path.getsize(full) > settings.max_file_size_bytes:
                         continue
+                    files_scanned += 1
                     with open(full, encoding="utf-8", errors="ignore") as f:
                         for i, line in enumerate(f, 1):
+                            lines_scanned += 1
+                            if lines_scanned > settings.max_search_lines:
+                                matches.append(
+                                    f"(search stopped: scanned {settings.max_search_lines} lines — narrow path_prefix or pattern)"
+                                )
+                                return "\n".join(matches)
                             if regex.search(line):
                                 matches.append(f"{rel_path}:{i}: {line.strip()[:120]}")
                                 if len(matches) >= max_matches:

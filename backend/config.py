@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     max_agent_turns: int = 30
     max_file_read_lines: int = 300
     max_file_size_bytes: int = 512_000
+    max_search_files: int = 400
+    max_search_lines: int = 30_000
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

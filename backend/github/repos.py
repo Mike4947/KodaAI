@@ -1,8 +1,6 @@
 import base64
-import hashlib
 import os
 import re
-import secrets
 import uuid
 
 import git
@@ -32,8 +30,11 @@ def _get_fernet():
 
     key = settings.fernet_key
     if not key:
-        # Derive a session-local key if not configured (tokens won't survive restart)
-        key = base64.urlsafe_b64encode(hashlib.sha256(b"kodaai-dev-key").digest())
+        raise ValueError(
+            "FERNET_KEY is not set. Generate one with: "
+            'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" '
+            "and add it to .env before using GitHub authentication."
+        )
     return Fernet(key.encode() if isinstance(key, str) else key)
 
 
@@ -61,6 +62,8 @@ def get_github_token() -> str | None:
     try:
         f = _get_fernet()
         return f.decrypt(row["encrypted_token"].encode()).decode()
+    except ValueError:
+        raise
     except Exception:
         return None
 
@@ -76,18 +79,28 @@ def clear_github_token():
         conn.execute("DELETE FROM github_tokens WHERE id = 1")
 
 
+def _clone_repository(owner: str, name: str, local_path: str, token: str | None) -> None:
+    clone_url = f"https://github.com/{owner}/{name}.git"
+    if not token:
+        git.Repo.clone_from(clone_url, local_path, depth=1)
+        return
+
+    auth_header = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env = os.environ.copy()
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraHeader"
+    env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth_header}"
+    git.Repo.clone_from(clone_url, local_path, depth=1, env=env)
+
+
 def clone_repo(owner: str, name: str, token: str | None = None, is_private: bool = False) -> dict:
     os.makedirs(settings.repos_dir, exist_ok=True)
     repo_id = str(uuid.uuid4())
     local_path = os.path.join(settings.repos_dir, repo_id)
     full_name = f"{owner}/{name}"
+    clone_url = f"https://github.com/{owner}/{name}.git"
 
-    if token:
-        clone_url = f"https://{token}@github.com/{owner}/{name}.git"
-    else:
-        clone_url = f"https://github.com/{owner}/{name}.git"
-
-    git.Repo.clone_from(clone_url, local_path, depth=1)
+    _clone_repository(owner, name, local_path, token)
 
     now = _now()
     with get_db() as conn:
@@ -96,7 +109,7 @@ def clone_repo(owner: str, name: str, token: str | None = None, is_private: bool
             INSERT INTO repos (id, owner, name, full_name, clone_url, local_path, is_private, cloned_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (repo_id, owner, name, full_name, clone_url.replace(token, "***") if token else clone_url, local_path, 1 if is_private else 0, now),
+            (repo_id, owner, name, full_name, clone_url, local_path, 1 if is_private else 0, now),
         )
 
     return get_repo(repo_id)
